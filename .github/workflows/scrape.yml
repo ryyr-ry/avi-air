@@ -1,0 +1,124 @@
+name: FlyTeam データ収集
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "対象地域（空欄で全地域同時実行）"
+        required: false
+        type: choice
+        options:
+          - ""
+          - asia
+          - europe
+          - north-america
+          - south-america
+          - central-america_caribbean
+          - oceania
+          - mideast
+          - africa
+          - antarctic_arctic
+  schedule:
+    - cron: "0 3 * * 1"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    strategy:
+      fail-fast: false
+      matrix:
+        region:
+          - asia
+          - europe
+          - north-america
+          - south-america
+          - central-america_caribbean
+          - oceania
+          - mideast
+          - africa
+          - antarctic_arctic
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: flyteam
+          POSTGRES_PASSWORD: flyteam
+          POSTGRES_DB: flyteam
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U flyteam"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      DATABASE_URL: postgresql://flyteam:flyteam@localhost:5432/flyteam
+
+    steps:
+      - name: リポジトリ取得
+        uses: actions/checkout@v4
+
+      - name: Python + uv セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: uv で高速インストール
+        run: |
+          pip install uv
+          uv pip install --system -r flyteam_collector/requirements.txt
+
+      - name: 対象地域の判定
+        id: target
+        run: |
+          INPUT="${{ github.event.inputs.region }}"
+          if [ -n "$INPUT" ] && [ "$INPUT" != "${{ matrix.region }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "スクレイピング実行: ${{ matrix.region }}"
+        if: steps.target.outputs.skip == 'false'
+        working-directory: flyteam_collector
+        run: python main.py --region ${{ matrix.region }}
+
+      - name: DBダンプ + pigz並列圧縮
+        if: steps.target.outputs.skip == 'false'
+        env:
+          PGPASSWORD: flyteam
+        run: |
+          REGION="${{ matrix.region }}"
+          DATE=$(date +%Y%m%d)
+          FILENAME="flyteam_${REGION}_${DATE}.sql.gz"
+
+          pg_dump -h localhost -U flyteam flyteam | pigz -p $(nproc) > "$FILENAME"
+
+          echo "DUMP_FILE=$FILENAME" >> "$GITHUB_ENV"
+          echo "REGION=$REGION" >> "$GITHUB_ENV"
+          echo "DATE=$DATE" >> "$GITHUB_ENV"
+
+          psql -h localhost -U flyteam flyteam -c "
+            SELECT 'aircrafts' AS t, COUNT(*) FROM aircrafts
+            UNION ALL SELECT 'histories', COUNT(*) FROM aircraft_histories
+            UNION ALL SELECT 'aliases', COUNT(*) FROM aircraft_aliases;
+          "
+
+      - name: Releaseにアップロード
+        if: steps.target.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "data-${{ env.DATE }}-${{ env.REGION }}"
+          name: "${{ env.REGION }} - ${{ env.DATE }}"
+          body: |
+            ## ${{ env.REGION }} データ収集結果
+            - 日時: ${{ env.DATE }}
+            - 復元: `gunzip -c ${{ env.DUMP_FILE }} | psql flyteam`
+          files: "${{ env.DUMP_FILE }}"
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

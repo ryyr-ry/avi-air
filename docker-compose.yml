@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:17
+    container_name: flyteam_postgres
+    environment:
+      POSTGRES_USER: flyteam
+      POSTGRES_PASSWORD: flyteam
+      POSTGRES_DB: flyteam
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:
