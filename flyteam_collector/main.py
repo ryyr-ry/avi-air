@@ -134,7 +134,7 @@ class FlyTeamCrawler:
                 async with self._session.get(
                     url, headers=HEADERS, timeout=timeout
                 ) as resp:
-                    if resp.status == 200:
+                    if resp.status < 300:
                         text = await resp.text()
                         elapsed = time.monotonic() - t0
                         self._stats["fetched"] += 1
