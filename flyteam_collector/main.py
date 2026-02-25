@@ -337,7 +337,7 @@ class FlyTeamCrawler:
                 pass
 
         # PlaywrightでCookie取得（JSチャレンジ突破）
-        cookies = await fetch_cookies()
+        cookies = await fetch_cookies(region=self._region or "asia")
 
         # コネクタ
         connector = aiohttp.TCPConnector(

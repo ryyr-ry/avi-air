@@ -1,9 +1,5 @@
 """
 Playwright を使ってFlyTeamのJSチャレンジを突破し、Cookieを取得する。
-
-GitHub Actions等のデータセンターIPからFlyTeamにアクセスすると、
-JavaScriptチャレンジページが返される。Playwrightで実際のブラウザを使い
-チャレンジを突破してCookieを取得し、以後のaiohttpリクエストで使い回す。
 """
 import logging
 from typing import Dict
@@ -13,15 +9,14 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://flyteam.jp"
 
 
-async def fetch_cookies(target_path: str = "/area/asia/airline") -> Dict[str, str]:
+async def fetch_cookies(region: str = "asia") -> Dict[str, str]:
     """
-    Playwrightでtarget_pathにアクセスし、Cookie を dict で返す。
-    JSチャレンジがある場合は最大30秒待機してコンテンツ出現を確認する。
+    Playwrightで /area/{region}/airline にアクセスし、Cookie を dict で返す。
     """
     from playwright.async_api import async_playwright
 
     cookies_dict: Dict[str, str] = {}
-    url = BASE_URL + target_path
+    url = f"{BASE_URL}/area/{region}/airline"
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -36,14 +31,17 @@ async def fetch_cookies(target_path: str = "/area/asia/airline") -> Dict[str, st
         page = await context.new_page()
 
         logger.info(f"Playwright: {url} にアクセス中...")
-        await page.goto(url, wait_until="networkidle", timeout=60000)
 
-        # コンテンツが描画されるまで最大30秒待機
+        # domcontentloaded で待機（networkidle は広告で永久に待つ）
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+        # コンテンツが描画されるまで最大15秒待機
         try:
-            await page.wait_for_selector("a[href*='/airline/']", timeout=30000)
+            await page.wait_for_selector("a[href*='/airline/']", timeout=15000)
             logger.info("Playwright: コンテンツ確認済み（航空会社リンク検出）")
         except Exception:
-            logger.warning("Playwright: 航空会社リンク未検出（チャレンジ突破失敗の可能性）")
+            # セレクタが見つからなくてもCookieは取れている可能性がある
+            logger.warning("Playwright: 航空会社リンク未検出（Cookieのみ取得を試行）")
 
         # Cookie 取得
         raw_cookies = await context.cookies()
