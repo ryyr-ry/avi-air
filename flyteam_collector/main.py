@@ -16,6 +16,7 @@ import asyncio
 import random
 import signal
 import logging
+import time
 from typing import Set, Any
 from enum import Enum, auto
 
@@ -87,7 +88,13 @@ class FlyTeamCrawler:
             "skipped": 0,
             "fetch_errors": 0,
             "db_errors": 0,
+            "countries": 0,
+            "airlines": 0,
+            "list_pages": 0,
+            "alias_crawls": 0,
+            "http_time_total": 0.0,
         }
+        self._start_time: float = 0.0
 
     # ─────────────────────────────────
     # visited管理（アトミック）
@@ -123,12 +130,16 @@ class FlyTeamCrawler:
                 return ""
 
             try:
+                t0 = time.monotonic()
                 async with self._session.get(
                     url, headers=HEADERS, timeout=timeout
                 ) as resp:
                     if resp.status == 200:
+                        text = await resp.text()
+                        elapsed = time.monotonic() - t0
                         self._stats["fetched"] += 1
-                        return await resp.text()
+                        self._stats["http_time_total"] += elapsed
+                        return text
 
                     if resp.status == 429:
                         retry_after = int(
@@ -189,6 +200,7 @@ class FlyTeamCrawler:
         country_urls = parse_country_links(html, region_filter=self._region)
         region_label = self._region or '全世界'
         logger.info(f"  → {len(country_urls)} カ国を検出 ({region_label})")
+        self._stats["countries"] = len(country_urls)
         for country_url in country_urls:
             self._enqueue(country_url, UrlType.COUNTRY)
 
@@ -200,7 +212,9 @@ class FlyTeamCrawler:
             return
 
         airline_links = parse_airline_links(html)
-        logger.info(f"  → {len(airline_links)} 社の航空会社を検出")
+        country_name = url.rstrip('/').split('/')[-2]  # /area/asia/japan/airline → japan
+        logger.info(f"  → {country_name}: {len(airline_links)} 社")
+        self._stats["airlines"] += len(airline_links)
         for link in airline_links:
             self._enqueue(link, UrlType.AIRLINE)
 
@@ -217,6 +231,12 @@ class FlyTeamCrawler:
             return
 
         detail_links, next_page = parse_aircraft_list(html)
+        airline_slug = url.split('/airline/')[-1].split('/')[0] if '/airline/' in url else '?'
+        logger.info(
+            f"  → {airline_slug}: {len(detail_links)}機検出"
+            f"{' | 次ページあり' if next_page else ' | 最終ページ'}"
+        )
+        self._stats["list_pages"] += 1
         for link in detail_links:
             self._enqueue(link, UrlType.DETAIL)
 
@@ -239,20 +259,37 @@ class FlyTeamCrawler:
             await self._repo.save_aircraft_data(aircraft, histories, aliases)
 
             self._stats["saved"] += 1
+            logger.debug(
+                f"保存: {target_reg} | sn={aircraft.serial_number} | "
+                f"hex={aircraft.hex_code} | 履歴{len(histories)}件 | "
+                f"エイリアス{len(aliases)}件"
+            )
+
             if self._stats["saved"] % 100 == 0:
+                elapsed = time.monotonic() - self._start_time
+                rate = self._stats['saved'] / elapsed if elapsed > 0 else 0
+                avg_http = (
+                    self._stats['http_time_total'] / self._stats['fetched']
+                    if self._stats['fetched'] > 0 else 0
+                )
                 logger.info(
-                    f"進捗: 保存={self._stats['saved']}, "
-                    f"取得={self._stats['fetched']}, "
-                    f"エラー={self._stats['fetch_errors']}"
+                    f"■ 進捗 [{elapsed:.0f}秒経過] | "
+                    f"保存={self._stats['saved']} ({rate:.1f}件/秒) | "
+                    f"HTTP取得={self._stats['fetched']} (平均{avg_http:.2f}秒) | "
+                    f"キュー残={self._url_queue.qsize()} | "
+                    f"visited={len(self._visited)} | "
+                    f"エラー={self._stats['fetch_errors']+self._stats['db_errors']}"
                 )
 
             # 芋づる式: 別レジ番の詳細ページをキューに追加
+            if alias_links:
+                self._stats["alias_crawls"] += len(alias_links)
             for link in alias_links:
                 self._enqueue(link, UrlType.DETAIL)
 
         except Exception as e:
             self._stats["db_errors"] += 1
-            logger.error(f"処理エラー ({url}): {e}")
+            logger.error(f"処理エラー ({target_reg}): {e}", exc_info=True)
 
     # ─────────────────────────────────
     # ワーカー（キューからURLを取り出して処理する）
@@ -324,11 +361,15 @@ class FlyTeamCrawler:
             connector=connector, timeout=timeout
         ) as session:
             self._session = session
+            self._start_time = time.monotonic()
             logger.info(
-                f"クローラー開始 | ワーカー数={CRAWL_WORKERS} | "
+                f"クローラー開始 | "
+                f"地域={self._region or '全世界'} | "
+                f"ワーカー数={CRAWL_WORKERS} | "
                 f"同時接続={CONCURRENCY_LIMIT} | "
                 f"最大試行={MAX_ATTEMPTS} | "
-                f"タイムアウト={REQUEST_TIMEOUT}秒"
+                f"タイムアウト={REQUEST_TIMEOUT}秒 | "
+                f"DBプール={pool.get_min_size()}-{pool.get_max_size()}"
             )
 
             # 起点URLの種別を判定してキューに投入
@@ -341,6 +382,7 @@ class FlyTeamCrawler:
             else:
                 start_type = UrlType.COUNTRY
             self._enqueue(start_url, start_type)
+            logger.info(f"起点: {start_url} (種別: {start_type.name})")
 
             # ワーカープール起動
             workers = [
@@ -348,19 +390,77 @@ class FlyTeamCrawler:
                 for i in range(CRAWL_WORKERS)
             ]
 
+            # 定期進捗レポーター（30秒ごと）
+            reporter = asyncio.create_task(self._progress_reporter())
+
             # 全ワーカーの完了を待つ
             await asyncio.gather(*workers)
+            reporter.cancel()
 
         # コネクションプール解放
         await pool.close()
 
+        # 最終統計レポート
+        total_time = time.monotonic() - self._start_time
+        self._print_final_report(total_time)
+
+    async def _progress_reporter(self):
+        """定期的に進捗状況をログに出力する。"""
+        try:
+            while True:
+                await asyncio.sleep(30)
+                elapsed = time.monotonic() - self._start_time
+                s = self._stats
+                rate = s['saved'] / elapsed if elapsed > 0 else 0
+                fetch_rate = s['fetched'] / elapsed if elapsed > 0 else 0
+                logger.info(
+                    f"━━ 定期レポート [{elapsed:.0f}秒] ━━\n"
+                    f"  国={s['countries']} | 航空会社={s['airlines']} | "
+                    f"一覧ページ={s['list_pages']}\n"
+                    f"  HTTP取得={s['fetched']} ({fetch_rate:.1f}/秒) | "
+                    f"機体保存={s['saved']} ({rate:.1f}/秒) | "
+                    f"芋づる={s['alias_crawls']}\n"
+                    f"  キュー残={self._url_queue.qsize()} | "
+                    f"visited={len(self._visited)} | "
+                    f"スキップ={s['skipped']} | "
+                    f"通信エラー={s['fetch_errors']} | "
+                    f"DBエラー={s['db_errors']}"
+                )
+        except asyncio.CancelledError:
+            pass
+
+    def _print_final_report(self, total_time: float):
+        """クロール完了時の最終統計レポート。"""
+        s = self._stats
+        minutes = total_time / 60
+        save_rate = s['saved'] / total_time if total_time > 0 else 0
+        fetch_rate = s['fetched'] / total_time if total_time > 0 else 0
+        avg_http = (
+            s['http_time_total'] / s['fetched']
+            if s['fetched'] > 0 else 0
+        )
         logger.info(
-            f"クローラー完了 | "
-            f"保存={self._stats['saved']} | "
-            f"取得={self._stats['fetched']} | "
-            f"スキップ={self._stats['skipped']} | "
-            f"通信エラー={self._stats['fetch_errors']} | "
-            f"DBエラー={self._stats['db_errors']}"
+            f"\n"
+            f"{'='*60}\n"
+            f"  クローラー完了レポート\n"
+            f"{'='*60}\n"
+            f"  地域        : {self._region or '全世界'}\n"
+            f"  総所要時間  : {minutes:.1f}分 ({total_time:.0f}秒)\n"
+            f"{'─'*60}\n"
+            f"  国          : {s['countries']}\n"
+            f"  航空会社    : {s['airlines']}\n"
+            f"  一覧ページ  : {s['list_pages']}\n"
+            f"  機体保存    : {s['saved']}\n"
+            f"  芋づる巡回  : {s['alias_crawls']}\n"
+            f"{'─'*60}\n"
+            f"  HTTP取得    : {s['fetched']} ({fetch_rate:.1f}件/秒)\n"
+            f"  HTTP平均    : {avg_http:.3f}秒/件\n"
+            f"  保存速度    : {save_rate:.1f}件/秒\n"
+            f"  スキップ    : {s['skipped']}\n"
+            f"  通信エラー  : {s['fetch_errors']}\n"
+            f"  DBエラー    : {s['db_errors']}\n"
+            f"  visited総数 : {len(self._visited)}\n"
+            f"{'='*60}"
         )
 
     def _handle_shutdown(self):
