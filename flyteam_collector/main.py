@@ -34,8 +34,8 @@ from cookie_fetcher import fetch_cookies
 # 定数
 # ─────────────────────────────────
 BASE_URL = "https://flyteam.jp"
-CRAWL_WORKERS = 100              # クロールワーカー数
-CONCURRENCY_LIMIT = 300          # 同時HTTP接続数
+CRAWL_WORKERS = 50               # クロールワーカー数
+CONCURRENCY_LIMIT = 100          # 同時HTTP接続数
 MAX_ATTEMPTS = 5                 # 最大試行回数（初回含む）
 RETRY_BASE_DELAY = 0.5           # リトライ基底遅延（秒）
 REQUEST_TIMEOUT = 15             # HTTP要求タイムアウト（秒）
