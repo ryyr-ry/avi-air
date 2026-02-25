@@ -66,7 +66,8 @@ logger = logging.getLogger("flyteam_crawler")
 # URL種別
 # ─────────────────────────────────
 class UrlType(Enum):
-    COUNTRY = auto()    # 国/地域別航空会社一覧
+    AREA = auto()       # エリア一覧（全国のリンクを収集）
+    COUNTRY = auto()    # 国別航空会社一覧
     AIRLINE = auto()    # 航空会社トップ → /aircrafts に変換
     LIST = auto()       # 機材一覧ページ
     DETAIL = auto()     # 個別機体ページ
@@ -192,6 +193,20 @@ class FlyTeamCrawler:
     # 各ページ種別の処理
     # ─────────────────────────────────
 
+    async def _process_area(self, url: str):
+        """エリア一覧 → 各国の航空会社一覧URLをキューに投入"""
+        logger.info(f"エリア一覧取得: {url}")
+        html = await self._fetch(url)
+        if not html:
+            return
+
+        country_urls = parse_country_links(html, region_filter=self._region)
+        region_label = self._region or '全世界'
+        logger.info(f"  → {len(country_urls)} カ国を検出 ({region_label})")
+        self._stats["countries"] = len(country_urls)
+        for country_url in country_urls:
+            self._enqueue(country_url, UrlType.COUNTRY)
+
     async def _process_country(self, url: str):
         """国別航空会社一覧 → 各航空会社をキューに投入"""
         logger.info(f"航空会社一覧取得: {url}")
@@ -286,6 +301,7 @@ class FlyTeamCrawler:
     async def _worker(self, worker_id: int):
         """URLキューからタスクを取り出し、種別に応じた処理を実行する。"""
         handlers = {
+            UrlType.AREA: self._process_area,
             UrlType.COUNTRY: self._process_country,
             UrlType.AIRLINE: self._process_airline,
             UrlType.LIST: self._process_list,
@@ -370,9 +386,10 @@ class FlyTeamCrawler:
 
             # 起点URLの組み立てと種別判定
             if not start_url:
-                # --region から直接 /area/{region}/airline を組み立てる
-                start_url = f"/area/{self._region}/airline"
-                start_type = UrlType.COUNTRY
+                start_url = "/area"
+                start_type = UrlType.AREA
+            elif start_url.rstrip('/').endswith('/area'):
+                start_type = UrlType.AREA
             elif '/airline/' in start_url and '/aircrafts' in start_url:
                 start_type = UrlType.LIST
             elif '/airline/' in start_url:
