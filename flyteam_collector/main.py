@@ -22,11 +22,13 @@ from typing import Set, Any
 from enum import Enum, auto
 
 import aiohttp
+import yarl
 
 from db_config import create_pool
 from database import init_db
 from repository import AircraftRepository
 from scraper import parse_country_links, parse_airline_links, parse_aircraft_list, parse_aircraft_detail
+from cookie_fetcher import fetch_cookies
 
 # ─────────────────────────────────
 # 定数
@@ -334,38 +336,32 @@ class FlyTeamCrawler:
             except NotImplementedError:
                 pass
 
-        # HTTPセッション
-        # コネクタ（プロキシ対応）
-        proxy_url = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY')
-        if proxy_url:
-            from aiohttp_socks import ProxyConnector
-            connector = ProxyConnector.from_url(
-                proxy_url,
-                limit=CONCURRENCY_LIMIT,
-                ttl_dns_cache=300,
-                enable_cleanup_closed=True,
-                keepalive_timeout=60,
-            )
-            proxy_label = proxy_url
-        else:
-            connector = aiohttp.TCPConnector(
-                limit=CONCURRENCY_LIMIT,
-                ttl_dns_cache=300,
-                enable_cleanup_closed=True,
-                keepalive_timeout=60,
-            )
-            proxy_label = 'なし'
+        # PlaywrightでCookie取得（JSチャレンジ突破）
+        cookies = await fetch_cookies()
 
+        # コネクタ
+        connector = aiohttp.TCPConnector(
+            limit=CONCURRENCY_LIMIT,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+            keepalive_timeout=60,
+        )
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+
+        # Cookieをセッションに設定
+        cookie_jar = aiohttp.CookieJar()
+        for name, value in cookies.items():
+            cookie_jar.update_cookies({name: value}, response_url=yarl.URL(BASE_URL))
+
         async with aiohttp.ClientSession(
-            connector=connector, timeout=timeout
+            connector=connector, timeout=timeout, cookie_jar=cookie_jar
         ) as session:
             self._session = session
             self._start_time = time.monotonic()
             logger.info(
                 f"クローラー開始 | "
                 f"地域={self._region or '全世界'} | "
-                f"プロキシ={proxy_label} | "
+                f"Cookie={len(cookies)}件 | "
                 f"ワーカー数={CRAWL_WORKERS} | "
                 f"同時接続={CONCURRENCY_LIMIT} | "
                 f"タイムアウト={REQUEST_TIMEOUT}秒 | "
