@@ -13,6 +13,7 @@ FlyTeam Collector - メインクローラー
   └── 別レジ番リンクの芋づる式巡回
 """
 import asyncio
+import os
 import random
 import signal
 import logging
@@ -334,12 +335,27 @@ class FlyTeamCrawler:
                 pass
 
         # HTTPセッション
-        connector = aiohttp.TCPConnector(
-            limit=CONCURRENCY_LIMIT,
-            ttl_dns_cache=300,
-            enable_cleanup_closed=True,
-            keepalive_timeout=60,
-        )
+        # コネクタ（プロキシ対応）
+        proxy_url = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY')
+        if proxy_url:
+            from aiohttp_socks import ProxyConnector
+            connector = ProxyConnector.from_url(
+                proxy_url,
+                limit=CONCURRENCY_LIMIT,
+                ttl_dns_cache=300,
+                enable_cleanup_closed=True,
+                keepalive_timeout=60,
+            )
+            proxy_label = proxy_url
+        else:
+            connector = aiohttp.TCPConnector(
+                limit=CONCURRENCY_LIMIT,
+                ttl_dns_cache=300,
+                enable_cleanup_closed=True,
+                keepalive_timeout=60,
+            )
+            proxy_label = 'なし'
+
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
         async with aiohttp.ClientSession(
             connector=connector, timeout=timeout
@@ -349,9 +365,9 @@ class FlyTeamCrawler:
             logger.info(
                 f"クローラー開始 | "
                 f"地域={self._region or '全世界'} | "
+                f"プロキシ={proxy_label} | "
                 f"ワーカー数={CRAWL_WORKERS} | "
                 f"同時接続={CONCURRENCY_LIMIT} | "
-                f"最大試行={MAX_ATTEMPTS} | "
                 f"タイムアウト={REQUEST_TIMEOUT}秒 | "
                 f"DBプール={pool.get_min_size()}-{pool.get_max_size()}"
             )

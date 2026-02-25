@@ -62,6 +62,27 @@ jobs:
       - name: リポジトリ取得
         uses: actions/checkout@v4
 
+      - name: Cloudflare WARP セットアップ
+        run: |
+          # WARP リポジトリ追加 + インストール
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cloudflare-warp
+
+          # WARP 登録 + 接続
+          sudo warp-cli --accept-tos registration new
+          sudo warp-cli --accept-tos mode proxy
+          sudo warp-cli --accept-tos proxy port 40000
+          sudo warp-cli --accept-tos connect
+
+          # 接続待ち
+          sleep 3
+          sudo warp-cli --accept-tos status
+          echo "WARP接続完了"
+
       - name: Python + uv セットアップ
         uses: actions/setup-python@v5
         with:
@@ -85,6 +106,9 @@ jobs:
       - name: "スクレイピング実行: ${{ matrix.region }}"
         if: steps.target.outputs.skip == 'false'
         working-directory: flyteam_collector
+        env:
+          HTTPS_PROXY: socks5://127.0.0.1:40000
+          HTTP_PROXY: socks5://127.0.0.1:40000
         run: python main.py --region ${{ matrix.region }}
 
       - name: DBダンプ + pigz並列圧縮
